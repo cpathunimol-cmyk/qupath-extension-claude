@@ -301,9 +301,7 @@ public class ClaudeStage extends Stage {
             if (!java.nio.file.Files.exists(dir.resolve("SKILL.md"))) {
                 java.nio.file.Files.createDirectories(dir.resolve("references"));
                 java.nio.file.Files.createDirectories(dir.resolve("examples"));
-                try (var in = ClaudeStage.class.getResourceAsStream("skill-template.md")) {
-                    java.nio.file.Files.write(dir.resolve("SKILL.md"), in.readAllBytes());
-                }
+                java.nio.file.Files.write(dir.resolve("SKILL.md"), readResource("skill-template.md"));
             }
             java.awt.Desktop.getDesktop().open(dir.toFile());
         } catch (Exception ex) {
@@ -311,12 +309,42 @@ public class ClaudeStage extends Stage {
         }
     }
 
+    /**
+     * Load a bundled resource. QuPath's extension class loader doesn't always resolve resources through
+     * Class.getResourceAsStream, so fall back to other loaders and finally to reading the jar directly.
+     */
+    private static byte[] readResource(String name) throws IOException {
+        String full = "qupath/ext/claude/" + name;
+        var candidates = new java.util.ArrayList<java.util.function.Supplier<java.io.InputStream>>();
+        candidates.add(() -> ClaudeStage.class.getResourceAsStream(name));
+        candidates.add(() -> ClaudeStage.class.getClassLoader().getResourceAsStream(full));
+        candidates.add(() -> Thread.currentThread().getContextClassLoader().getResourceAsStream(full));
+        for (var c : candidates) {
+            try (var in = c.get()) {
+                if (in != null)
+                    return in.readAllBytes();
+            } catch (Exception ignored) {
+            }
+        }
+        try {
+            var loc = ClaudeStage.class.getProtectionDomain().getCodeSource().getLocation();
+            try (var zip = new java.util.zip.ZipFile(new File(loc.toURI()))) {
+                var entry = zip.getEntry(full);
+                if (entry != null)
+                    try (var in = zip.getInputStream(entry)) {
+                        return in.readAllBytes();
+                    }
+            }
+        } catch (Exception e) {
+            throw new IOException("Could not load bundled resource " + name + ": " + e, e);
+        }
+        throw new IOException("Bundled resource not found: " + name);
+    }
+
     private static java.nio.file.Path systemPromptFile() throws IOException {
         var f = java.nio.file.Files.createTempFile("qupath-claude-system", ".md");
         f.toFile().deleteOnExit();
-        try (var in = ClaudeStage.class.getResourceAsStream("system-prompt.md")) {
-            java.nio.file.Files.write(f, in.readAllBytes());
-        }
+        java.nio.file.Files.write(f, readResource("system-prompt.md"));
         return f;
     }
 
