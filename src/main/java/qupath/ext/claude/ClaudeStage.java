@@ -125,10 +125,20 @@ public class ClaudeStage extends Stage {
         if (windows) {
             args.addAll(List.of("cmd", "/c", cmd, "-p"));
         } else {
-            // GUI apps on macOS/Linux often lack the user's PATH; use a login shell
-            args.addAll(List.of("/bin/sh", "-lc", cmd + " -p"));
+            // GUI apps on macOS/Linux often lack the user's PATH; use the user's own login shell
+            String shell = System.getenv("SHELL");
+            if (shell == null || shell.isBlank())
+                shell = "/bin/sh";
+            args.addAll(List.of(shell, "-lc", cmd + " -p"));
         }
         var pb = new ProcessBuilder(args).redirectErrorStream(true);
+        if (!windows) {
+            // Fallback for common install locations (native installer, Homebrew, npm)
+            String home = System.getProperty("user.home");
+            String extra = home + "/.local/bin:" + home + "/.claude/local:/opt/homebrew/bin:/usr/local/bin";
+            String path = pb.environment().getOrDefault("PATH", "/usr/bin:/bin");
+            pb.environment().put("PATH", extra + ":" + path);
+        }
         var project = qupath.getProject();
         File dir = project != null && project.getPath() != null
                 ? project.getPath().getParent().toFile()
