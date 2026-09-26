@@ -37,7 +37,15 @@ public class ClaudeStage extends Stage {
     private final Button openScript = new Button("Open last script in editor");
     private final CheckBox includeContext = new CheckBox("Include image/selection context");
     private final TextField claudePath = new TextField();
+    private final javafx.scene.control.ComboBox<String> attach =
+            new javafx.scene.control.ComboBox<>(javafx.collections.FXCollections.observableArrayList(
+                    ATTACH_NONE, ATTACH_SELECTION, ATTACH_VIEWPORT));
+    private final Button skillFolder = new Button("Pathology skill folder");
     private String lastScript;
+    private static final String ATTACH_NONE = "No image";
+    private static final String ATTACH_SELECTION = "Attach selected region";
+    private static final String ATTACH_VIEWPORT = "Attach current viewport";
+    private static final int MAX_IMAGE_SIDE = 1568;
 
     private static final javafx.beans.property.StringProperty CLAUDE_CMD =
             PathPrefs.createPersistentPreference("ext.claude.command", "claude");
@@ -59,9 +67,12 @@ public class ClaudeStage extends Stage {
         claudePath.textProperty().bindBidirectional(CLAUDE_CMD);
         claudePath.setPromptText("claude executable");
 
+        attach.getSelectionModel().selectFirst();
+        skillFolder.setOnAction(e -> openSkillFolder());
         var top = new HBox(8, includeContext, claudePath);
         HBox.setHgrow(claudePath, Priority.ALWAYS);
-        var bottom = new VBox(6, new HBox(6, input, send), openScript);
+        var bottom = new VBox(6, new HBox(6, attach, skillFolder), new HBox(6, input, send), openScript,
+                new javafx.scene.control.Label("Research use only - not a validated diagnostic tool."));
         var root = new BorderPane(output);
         root.setTop(top);
         root.setBottom(bottom);
@@ -78,10 +89,23 @@ public class ClaudeStage extends Stage {
         send.setDisable(true);
         output.appendText("\n> " + prompt + "\n\n");
         String full = includeContext.isSelected() ? buildContext() + "\nREQUEST\n" + prompt : prompt;
+        final ImageJob job = attach.getValue().equals(ATTACH_NONE) ? null : captureImageJob(attach.getValue());
+        if (!attach.getValue().equals(ATTACH_NONE) && job == null) {
+            output.appendText("[no image or region to attach]\n");
+            send.setDisable(false);
+            return;
+        }
 
         Thread t = new Thread(() -> {
             try {
-                runClaude(full);
+                String text = full;
+                if (job != null) {
+                    var png = writeImage(job);
+                    text += "\n\nATTACHED IMAGE (" + job.label() + ", downsample " + String.format("%.2f", job.downsample())
+                            + "): " + png + "\nRead this image file, then follow the qupath-pathology skill.";
+                    append("[attached " + job.label() + "]\n");
+                }
+                runClaude(text);
             } catch (Exception ex) {
                 append("\n[error] " + ex.getMessage() + "\n");
             } finally {
@@ -170,13 +194,15 @@ public class ClaudeStage extends Stage {
         List<String> args = new ArrayList<>();
         boolean windows = System.getProperty("os.name").toLowerCase().contains("win");
         if (windows) {
-            args.addAll(List.of("cmd", "/c", cmd, "-p", "--append-system-prompt-file", promptFile.toString()));
+            args.addAll(List.of("cmd", "/c", cmd, "-p", "--append-system-prompt-file", promptFile.toString(),
+                    "--allowedTools", "Read,Glob,Grep", "--add-dir", TMP_DIR.toString()));
         } else {
             // GUI apps on macOS/Linux often lack the user's PATH; use the user's own login shell
             String shell = System.getenv("SHELL");
             if (shell == null || shell.isBlank())
                 shell = "/bin/sh";
-            args.addAll(List.of(shell, "-lc", cmd + " -p --append-system-prompt-file '" + promptFile + "'"));
+            args.addAll(List.of(shell, "-lc", cmd + " -p --append-system-prompt-file '" + promptFile + "'"
+                    + " --allowedTools Read,Glob,Grep --add-dir '" + TMP_DIR + "'"));
         }
         var pb = new ProcessBuilder(args).redirectErrorStream(true);
         if (!windows) {
@@ -215,6 +241,73 @@ public class ClaudeStage extends Stage {
         if (last != null) {
             lastScript = last;
             Platform.runLater(() -> openScript.setDisable(false));
+        }
+    }
+
+    private static final java.nio.file.Path TMP_DIR = createTmpDir();
+
+    private static java.nio.file.Path createTmpDir() {
+        try {
+            var d = java.nio.file.Files.createTempDirectory("qupath-claude-");
+            d.toFile().deleteOnExit();
+            return d;
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private record ImageJob(qupath.lib.images.servers.ImageServer<java.awt.image.BufferedImage> server,
+                            int x, int y, int w, int h, double downsample, String label) {}
+
+    /** Work out the region to export (must run on the FX thread). */
+    private ImageJob captureImageJob(String mode) {
+        var viewer = qupath.getViewer();
+        var server = viewer == null ? null : viewer.getServer();
+        if (server == null)
+            return null;
+        java.awt.Rectangle r;
+        String label;
+        if (mode.equals(ATTACH_SELECTION)) {
+            var sel = viewer.getSelectedObject();
+            if (sel == null || sel.getROI() == null)
+                return null;
+            var roi = sel.getROI();
+            r = new java.awt.Rectangle((int) roi.getBoundsX(), (int) roi.getBoundsY(),
+                    Math.max(1, (int) Math.ceil(roi.getBoundsWidth())), Math.max(1, (int) Math.ceil(roi.getBoundsHeight())));
+            label = "selected region " + r.width + "x" + r.height + " px at (" + r.x + "," + r.y + ")";
+        } else {
+            r = viewer.getDisplayedRegionShape().getBounds();
+            label = "viewport " + r.width + "x" + r.height + " px at (" + r.x + "," + r.y + ")";
+        }
+        r = r.intersection(new java.awt.Rectangle(0, 0, server.getWidth(), server.getHeight()));
+        if (r.isEmpty())
+            return null;
+        double ds = Math.max(1.0, Math.max(r.width, r.height) / (double) MAX_IMAGE_SIDE);
+        return new ImageJob(server, r.x, r.y, r.width, r.height, ds, label);
+    }
+
+    private static java.nio.file.Path writeImage(ImageJob j) throws IOException {
+        var img = j.server().readRegion(j.downsample(), j.x(), j.y(), j.w(), j.h());
+        var f = java.nio.file.Files.createTempFile(TMP_DIR, "region-", ".png");
+        javax.imageio.ImageIO.write(img, "png", f.toFile());
+        f.toFile().deleteOnExit();
+        return f;
+    }
+
+    /** Open (creating from a template if needed) the folder holding the pathology skill. */
+    private void openSkillFolder() {
+        try {
+            var dir = java.nio.file.Path.of(System.getProperty("user.home"), ".claude", "skills", "qupath-pathology");
+            if (!java.nio.file.Files.exists(dir.resolve("SKILL.md"))) {
+                java.nio.file.Files.createDirectories(dir.resolve("references"));
+                java.nio.file.Files.createDirectories(dir.resolve("examples"));
+                try (var in = ClaudeStage.class.getResourceAsStream("skill-template.md")) {
+                    java.nio.file.Files.write(dir.resolve("SKILL.md"), in.readAllBytes());
+                }
+            }
+            java.awt.Desktop.getDesktop().open(dir.toFile());
+        } catch (Exception ex) {
+            output.appendText("[could not open skill folder] " + ex.getMessage() + "\n");
         }
     }
 
