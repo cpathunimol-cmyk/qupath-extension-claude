@@ -77,7 +77,7 @@ public class ClaudeStage extends Stage {
         input.clear();
         send.setDisable(true);
         output.appendText("\n> " + prompt + "\n\n");
-        String full = includeContext.isSelected() ? buildContext() + "\n\n" + prompt : prompt;
+        String full = includeContext.isSelected() ? buildContext() + "\nREQUEST\n" + prompt : prompt;
 
         Thread t = new Thread(() -> {
             try {
@@ -92,44 +92,91 @@ public class ClaudeStage extends Stage {
         t.start();
     }
 
-    /** Gather context on the GUI thread-safe-ish (read-only) state. */
+    /** Gather a description of the live image for the prompt. */
     private String buildContext() {
-        var sb = new StringBuilder();
-        sb.append("You are helping inside QuPath (digital pathology). ")
-          .append("When asked for code, reply with a single ```groovy block using the QuPath scripting API.\n");
+        var sb = new StringBuilder("CONTEXT\n");
         var project = qupath.getProject();
         if (project != null)
             sb.append("Project: ").append(project.getName()).append(" (")
               .append(project.getImageList().size()).append(" images)\n");
         var imageData = qupath.getImageData();
-        if (imageData != null) {
-            var server = imageData.getServer();
-            var hier = imageData.getHierarchy();
-            sb.append("Image: ").append(server.getMetadata().getName())
-              .append(", ").append(server.getWidth()).append("x").append(server.getHeight())
-              .append(", type=").append(imageData.getImageType())
-              .append(", pixelSize=").append(server.getPixelCalibration().getAveragedPixelSize()).append("\n");
-            sb.append("Annotations: ").append(hier.getAnnotationObjects().size())
-              .append(", detections: ").append(hier.getDetectionObjects().size())
-              .append(", selected: ").append(hier.getSelectionModel().getSelectedObjects().size()).append("\n");
-        } else {
-            sb.append("No image open.\n");
+        if (imageData == null)
+            return sb.append("No image open.\n").toString();
+        var server = imageData.getServer();
+        var hier = imageData.getHierarchy();
+        var cal = server.getPixelCalibration();
+        sb.append("Image: ").append(server.getMetadata().getName())
+          .append(", ").append(server.getWidth()).append("x").append(server.getHeight()).append(" px")
+          .append(", type=").append(imageData.getImageType())
+          .append(", channels=").append(server.nChannels())
+          .append(", pixel size=").append(cal.hasPixelSizeMicrons()
+                  ? cal.getAveragedPixelSizeMicrons() + " um" : "unknown").append("\n");
+
+        var annotations = hier.getAnnotationObjects();
+        var detections = hier.getDetectionObjects();
+        sb.append("Annotations: ").append(annotations.size()).append(" ")
+          .append(countByClass(annotations)).append("\n");
+        sb.append("Detections: ").append(detections.size()).append(" ")
+          .append(countByClass(detections)).append("\n");
+        sb.append("Annotation measurements: ").append(measurementNames(annotations)).append("\n");
+        sb.append("Detection measurements: ").append(measurementNames(detections)).append("\n");
+
+        var selected = hier.getSelectionModel().getSelectedObjects();
+        sb.append("Selected objects: ").append(selected.size()).append("\n");
+        int shown = 0;
+        for (var o : selected) {
+            if (shown++ >= 5) {
+                sb.append("  ...\n");
+                break;
+            }
+            sb.append("  - ").append(o.getClass().getSimpleName())
+              .append(" name=").append(o.getName())
+              .append(" class=").append(o.getPathClass());
+            var roi = o.getROI();
+            if (roi != null)
+                sb.append(" roi=").append(roi.getRoiName()).append(" bounds=[")
+                  .append((int) roi.getBoundsX()).append(",").append((int) roi.getBoundsY()).append(",")
+                  .append((int) roi.getBoundsWidth()).append("x").append((int) roi.getBoundsHeight()).append("]");
+            sb.append(" children=").append(o.nChildObjects()).append("\n");
         }
         return sb.toString();
     }
 
+    private static String countByClass(java.util.Collection<? extends qupath.lib.objects.PathObject> objs) {
+        var counts = new java.util.TreeMap<String, Integer>();
+        for (var o : objs)
+            counts.merge(String.valueOf(o.getPathClass()), 1, Integer::sum);
+        return counts.toString();
+    }
+
+    /** Measurement names from a sample of objects (capped to keep the prompt small). */
+    private static String measurementNames(java.util.Collection<? extends qupath.lib.objects.PathObject> objs) {
+        var names = new java.util.LinkedHashSet<String>();
+        int n = 0;
+        for (var o : objs) {
+            names.addAll(o.getMeasurementList().getNames());
+            if (++n >= 50)
+                break;
+        }
+        var list = new ArrayList<>(names);
+        if (list.size() > 60)
+            return list.subList(0, 60) + " ... (" + list.size() + " total)";
+        return list.toString();
+    }
+
     private void runClaude(String prompt) throws IOException, InterruptedException {
         String cmd = CLAUDE_CMD.get().trim();
+        java.nio.file.Path promptFile = systemPromptFile();
         List<String> args = new ArrayList<>();
         boolean windows = System.getProperty("os.name").toLowerCase().contains("win");
         if (windows) {
-            args.addAll(List.of("cmd", "/c", cmd, "-p"));
+            args.addAll(List.of("cmd", "/c", cmd, "-p", "--append-system-prompt-file", promptFile.toString()));
         } else {
             // GUI apps on macOS/Linux often lack the user's PATH; use the user's own login shell
             String shell = System.getenv("SHELL");
             if (shell == null || shell.isBlank())
                 shell = "/bin/sh";
-            args.addAll(List.of(shell, "-lc", cmd + " -p"));
+            args.addAll(List.of(shell, "-lc", cmd + " -p --append-system-prompt-file '" + promptFile + "'"));
         }
         var pb = new ProcessBuilder(args).redirectErrorStream(true);
         if (!windows) {
@@ -169,6 +216,15 @@ public class ClaudeStage extends Stage {
             lastScript = last;
             Platform.runLater(() -> openScript.setDisable(false));
         }
+    }
+
+    private static java.nio.file.Path systemPromptFile() throws IOException {
+        var f = java.nio.file.Files.createTempFile("qupath-claude-system", ".md");
+        f.toFile().deleteOnExit();
+        try (var in = ClaudeStage.class.getResourceAsStream("system-prompt.md")) {
+            java.nio.file.Files.write(f, in.readAllBytes());
+        }
+        return f;
     }
 
     private void openInEditor() {
