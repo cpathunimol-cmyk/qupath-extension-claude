@@ -41,14 +41,29 @@ public class ClaudeStage extends Stage {
             new javafx.scene.control.ComboBox<>(javafx.collections.FXCollections.observableArrayList(
                     ATTACH_NONE, ATTACH_SELECTION, ATTACH_VIEWPORT));
     private final Button skillFolder = new Button("Pathology skill folder");
-    private String lastScript;
+    private final Button exportMd = new Button("Export as Markdown");
+    private final javafx.scene.control.ComboBox<String> modelChoice =
+            new javafx.scene.control.ComboBox<>(javafx.collections.FXCollections.observableArrayList(
+                    MODEL_DEFAULT, "sonnet", "opus", "fable", "haiku"));
+    private final javafx.scene.control.Label modelLabel = new javafx.scene.control.Label();
+    private volatile String lastScript;
+    private volatile String lastPrompt;
+    private volatile String lastResponse;
     private static final String ATTACH_NONE = "No image";
     private static final String ATTACH_SELECTION = "Attach selected region";
     private static final String ATTACH_VIEWPORT = "Attach current viewport";
     private static final int MAX_IMAGE_SIDE = 1568;
+    private static final String MODEL_DEFAULT = "(CLI default)";
+    private static final java.time.format.DateTimeFormatter FILE_STAMP =
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd_HHmmss");
 
     private static final javafx.beans.property.StringProperty CLAUDE_CMD =
             PathPrefs.createPersistentPreference("ext.claude.command", "claude");
+    private static final javafx.beans.property.StringProperty MODEL_PREF =
+            PathPrefs.createPersistentPreference("ext.claude.model", MODEL_DEFAULT);
+    private static final javafx.beans.property.StringProperty EXPORT_DIR_PREF =
+            PathPrefs.createPersistentPreference("ext.claude.exportDir",
+                    java.nio.file.Path.of(System.getProperty("user.home"), "QuPath", "claude-notes").toString());
 
     public ClaudeStage(QuPathGUI qupath) {
         this.qupath = qupath;
@@ -69,9 +84,25 @@ public class ClaudeStage extends Stage {
 
         attach.getSelectionModel().selectFirst();
         skillFolder.setOnAction(e -> openSkillFolder());
-        var top = new HBox(8, includeContext, claudePath);
+        exportMd.setDisable(true);
+        exportMd.setTooltip(new javafx.scene.control.Tooltip("Saves the last response to " + EXPORT_DIR_PREF.get()));
+        exportMd.setOnAction(e -> exportMarkdown());
+
+        String savedModel = MODEL_PREF.get();
+        modelChoice.setEditable(true);
+        modelChoice.setValue(savedModel == null || savedModel.isBlank() ? MODEL_DEFAULT : savedModel);
+        modelLabel.getStyleClass().add("label");
+        updateModelLabel();
+        modelChoice.valueProperty().addListener((obs, oldV, newV) -> {
+            MODEL_PREF.set(newV == null ? MODEL_DEFAULT : newV);
+            updateModelLabel();
+        });
+
+        var top = new VBox(4,
+                new HBox(8, includeContext, claudePath),
+                new HBox(8, new javafx.scene.control.Label("Model:"), modelChoice, modelLabel));
         HBox.setHgrow(claudePath, Priority.ALWAYS);
-        var bottom = new VBox(6, new HBox(6, attach, skillFolder), new HBox(6, input, send), openScript,
+        var bottom = new VBox(6, new HBox(6, attach, skillFolder, exportMd), new HBox(6, input, send), openScript,
                 new javafx.scene.control.Label("Research use only - not a validated diagnostic tool."));
         var root = new BorderPane(output);
         root.setTop(top);
@@ -87,6 +118,7 @@ public class ClaudeStage extends Stage {
             return;
         input.clear();
         send.setDisable(true);
+        lastPrompt = prompt;
         output.appendText("\n> " + prompt + "\n\n");
         String full = includeContext.isSelected() ? buildContext() + "\nREQUEST\n" + prompt : prompt;
         final ImageJob job = attach.getValue().equals(ATTACH_NONE) ? null : captureImageJob(attach.getValue());
@@ -191,18 +223,23 @@ public class ClaudeStage extends Stage {
     private void runClaude(String prompt) throws IOException, InterruptedException {
         String cmd = CLAUDE_CMD.get().trim();
         java.nio.file.Path promptFile = systemPromptFile();
+        String model = modelChoice.getValue();
+        String modelArgs = (model == null || model.isBlank() || model.equals(MODEL_DEFAULT))
+                ? "" : " --model '" + model.replace("'", "'\\''") + "'";
         List<String> args = new ArrayList<>();
         boolean windows = System.getProperty("os.name").toLowerCase().contains("win");
         if (windows) {
             args.addAll(List.of("cmd", "/c", cmd, "-p", "--append-system-prompt-file", promptFile.toString(),
                     "--allowedTools", "Read,Glob,Grep", "--add-dir", TMP_DIR.toString()));
+            if (!modelArgs.isEmpty())
+                args.addAll(List.of("--model", model));
         } else {
             // GUI apps on macOS/Linux often lack the user's PATH; use the user's own login shell
             String shell = System.getenv("SHELL");
             if (shell == null || shell.isBlank())
                 shell = "/bin/sh";
             args.addAll(List.of(shell, "-lc", cmd + " -p --append-system-prompt-file '" + promptFile + "'"
-                    + " --allowedTools Read,Glob,Grep --add-dir '" + TMP_DIR + "'"));
+                    + " --allowedTools Read,Glob,Grep --add-dir '" + TMP_DIR + "'" + modelArgs));
         }
         var pb = new ProcessBuilder(args).redirectErrorStream(true);
         if (!windows) {
@@ -234,6 +271,9 @@ public class ClaudeStage extends Stage {
         if (code != 0)
             append("\n[claude exited with code " + code + "]\n");
 
+        lastResponse = response.toString();
+        Platform.runLater(() -> exportMd.setDisable(false));
+
         Matcher m = GROOVY_BLOCK.matcher(response);
         String last = null;
         while (m.find())
@@ -241,6 +281,44 @@ public class ClaudeStage extends Stage {
         if (last != null) {
             lastScript = last;
             Platform.runLater(() -> openScript.setDisable(false));
+        }
+    }
+
+    private void updateModelLabel() {
+        String v = modelChoice.getValue();
+        modelLabel.setText(v == null || v.isBlank() || v.equals(MODEL_DEFAULT)
+                ? "using the claude CLI's own default model" : "will run as: " + v);
+    }
+
+    /** Write the most recent response to a timestamped .md file in the export folder. */
+    private void exportMarkdown() {
+        String response = lastResponse;
+        if (response == null || response.isBlank()) {
+            output.appendText("[nothing to export yet]\n");
+            return;
+        }
+        try {
+            var dir = java.nio.file.Path.of(EXPORT_DIR_PREF.get());
+            java.nio.file.Files.createDirectories(dir);
+            String stamp = java.time.LocalDateTime.now().format(FILE_STAMP);
+            var file = dir.resolve("claude-" + stamp + ".md");
+
+            var sb = new StringBuilder();
+            sb.append("# Claude Code note\n\n");
+            sb.append("- Date: ").append(java.time.LocalDateTime.now()).append("\n");
+            sb.append("- Model: ").append(modelChoice.getValue()).append("\n");
+            var imageData = qupath.getImageData();
+            if (imageData != null)
+                sb.append("- Image: ").append(imageData.getServer().getMetadata().getName()).append("\n");
+            sb.append("- Research use only - not a validated diagnostic tool.\n\n");
+            if (lastPrompt != null)
+                sb.append("## Prompt\n\n").append(lastPrompt).append("\n\n");
+            sb.append("## Response\n\n").append(response).append("\n");
+
+            java.nio.file.Files.writeString(file, sb.toString(), StandardCharsets.UTF_8);
+            output.appendText("[exported to " + file + "]\n");
+        } catch (IOException ex) {
+            output.appendText("[export failed] " + ex.getMessage() + "\n");
         }
     }
 
