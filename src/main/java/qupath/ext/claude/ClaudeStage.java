@@ -23,6 +23,7 @@ import javafx.stage.Stage;
 import qupath.lib.gui.QuPathGUI;
 import qupath.lib.gui.prefs.PathPrefs;
 import qupath.lib.gui.scripting.ScriptEditor;
+import qupath.lib.gui.tools.GuiTools;
 
 /** Simple chat-style window that shells out to the {@code claude} CLI. */
 public class ClaudeStage extends Stage {
@@ -40,7 +41,7 @@ public class ClaudeStage extends Stage {
     private final javafx.scene.control.ComboBox<String> attach =
             new javafx.scene.control.ComboBox<>(javafx.collections.FXCollections.observableArrayList(
                     ATTACH_NONE, ATTACH_SELECTION, ATTACH_VIEWPORT));
-    private final Button skillFolder = new Button("Pathology skill folder");
+    private final javafx.scene.control.SplitMenuButton skillsFolder = new javafx.scene.control.SplitMenuButton();
     private final Button exportMd = new Button("Export as Markdown");
     private final javafx.scene.control.ComboBox<String> modelChoice =
             new javafx.scene.control.ComboBox<>(javafx.collections.FXCollections.observableArrayList(
@@ -61,6 +62,11 @@ public class ClaudeStage extends Stage {
             PathPrefs.createPersistentPreference("ext.claude.command", "claude");
     private static final javafx.beans.property.StringProperty MODEL_PREF =
             PathPrefs.createPersistentPreference("ext.claude.model", MODEL_DEFAULT);
+    /** Folder that contains the qupath-pathology and qupath-scripting skill folders (empty = not chosen yet). */
+    private static final javafx.beans.property.StringProperty SKILLS_DIR_PREF =
+            PathPrefs.createPersistentPreference("ext.claude.skillsDir", "");
+    private static final String PATHOLOGY_SKILL = "qupath-pathology";
+    private static final String SCRIPTING_SKILL = "qupath-scripting";
     private static final javafx.beans.property.StringProperty EXPORT_DIR_PREF =
             PathPrefs.createPersistentPreference("ext.claude.exportDir",
                     java.nio.file.Path.of(System.getProperty("user.home"), "QuPath", "claude-notes").toString());
@@ -83,7 +89,17 @@ public class ClaudeStage extends Stage {
         claudePath.setPromptText("claude executable");
 
         attach.getSelectionModel().selectFirst();
-        skillFolder.setOnAction(e -> openSkillFolder());
+        skillsFolder.setText("Skills folder");
+        skillsFolder.setOnAction(e -> openSkillsFolder());
+        var openItem = new javafx.scene.control.MenuItem("Open skills folder");
+        openItem.setOnAction(e -> openSkillsFolder());
+        var changeItem = new javafx.scene.control.MenuItem("Change skills folder...");
+        changeItem.setOnAction(e -> {
+            if (chooseSkillsDir() != null)
+                openSkillsFolder();
+        });
+        skillsFolder.getItems().addAll(openItem, changeItem);
+        updateSkillsTooltip();
         exportMd.setDisable(true);
         exportMd.setTooltip(new javafx.scene.control.Tooltip("Saves the last response to " + EXPORT_DIR_PREF.get()));
         exportMd.setOnAction(e -> exportMarkdown());
@@ -102,7 +118,7 @@ public class ClaudeStage extends Stage {
                 new HBox(8, includeContext, claudePath),
                 new HBox(8, new javafx.scene.control.Label("Model:"), modelChoice, modelLabel));
         HBox.setHgrow(claudePath, Priority.ALWAYS);
-        var bottom = new VBox(6, new HBox(6, attach, skillFolder, exportMd), new HBox(6, input, send), openScript,
+        var bottom = new VBox(6, new HBox(6, attach, skillsFolder, exportMd), new HBox(6, input, send), openScript,
                 new javafx.scene.control.Label("Research use only - not a validated diagnostic tool."));
         var root = new BorderPane(output);
         root.setTop(top);
@@ -128,16 +144,22 @@ public class ClaudeStage extends Stage {
             return;
         }
 
+        final java.nio.file.Path skillsDir = resolveSkillsDir(false);
+        final String skills = skillsBlock(skillsDir, job != null);
+        if (job != null && !hasSkill(skillsDir, PATHOLOGY_SKILL))
+            output.appendText("[pathology skill not found - use 'Skills folder' to choose where it lives]\n");
+
         Thread t = new Thread(() -> {
             try {
                 String text = full;
                 if (job != null) {
                     var png = writeImage(job);
                     text += "\n\nATTACHED IMAGE (" + job.label() + ", downsample " + String.format("%.2f", job.downsample())
-                            + "): " + png + "\nRead this image file, then follow the qupath-pathology skill.";
+                            + "): " + png + "\nRead this image file.";
                     append("[attached " + job.label() + "]\n");
                 }
-                runClaude(text);
+                text += skills;
+                runClaude(text, skillsDir);
             } catch (Exception ex) {
                 append("\n[error] " + ex.getMessage() + "\n");
             } finally {
@@ -220,7 +242,7 @@ public class ClaudeStage extends Stage {
         return list.toString();
     }
 
-    private void runClaude(String prompt) throws IOException, InterruptedException {
+    private void runClaude(String prompt, java.nio.file.Path skillsDir) throws IOException, InterruptedException {
         String cmd = CLAUDE_CMD.get().trim();
         java.nio.file.Path promptFile = systemPromptFile();
         String model = modelChoice.getValue();
@@ -233,13 +255,16 @@ public class ClaudeStage extends Stage {
                     "--allowedTools", "Read,Glob,Grep", "--add-dir", TMP_DIR.toString()));
             if (!modelArgs.isEmpty())
                 args.addAll(List.of("--model", model));
+            if (skillsDir != null)
+                args.addAll(List.of("--add-dir", skillsDir.toString()));
         } else {
             // GUI apps on macOS/Linux often lack the user's PATH; use the user's own login shell
             String shell = System.getenv("SHELL");
             if (shell == null || shell.isBlank())
                 shell = "/bin/sh";
             args.addAll(List.of(shell, "-lc", cmd + " -p --append-system-prompt-file '" + promptFile + "'"
-                    + " --allowedTools Read,Glob,Grep --add-dir '" + TMP_DIR + "'" + modelArgs));
+                    + " --allowedTools Read,Glob,Grep --add-dir " + shellQuote(TMP_DIR.toString()) + modelArgs
+                    + (skillsDir == null ? "" : " --add-dir " + shellQuote(skillsDir.toString()))));
         }
         var pb = new ProcessBuilder(args).redirectErrorStream(true);
         if (!windows) {
@@ -372,19 +397,94 @@ public class ClaudeStage extends Stage {
         return f;
     }
 
-    /** Open (creating from a template if needed) the folder holding the pathology skill. */
-    private void openSkillFolder() {
-        try {
-            var dir = java.nio.file.Path.of(System.getProperty("user.home"), ".claude", "skills", "qupath-pathology");
-            if (!java.nio.file.Files.exists(dir.resolve("SKILL.md"))) {
-                java.nio.file.Files.createDirectories(dir.resolve("references"));
-                java.nio.file.Files.createDirectories(dir.resolve("examples"));
-                java.nio.file.Files.write(dir.resolve("SKILL.md"), readResource("skill-template.md"));
-            }
-            java.awt.Desktop.getDesktop().open(dir.toFile());
-        } catch (Exception ex) {
-            output.appendText("[could not open skill folder] " + ex.getMessage() + "\n");
+    private static String shellQuote(String s) {
+        return "'" + s.replace("'", "'\\''") + "'";
+    }
+
+    private static boolean hasSkill(java.nio.file.Path root, String name) {
+        return root != null && java.nio.file.Files.isRegularFile(root.resolve(name).resolve("SKILL.md"));
+    }
+
+    /**
+     * The folder holding the skill folders: the saved preference if it still exists, else the Claude Code default
+     * (~/.claude/skills) if the pathology skill is already there, else ask the user (only if {@code prompt}).
+     */
+    private java.nio.file.Path resolveSkillsDir(boolean prompt) {
+        String saved = SKILLS_DIR_PREF.get();
+        if (saved != null && !saved.isBlank() && java.nio.file.Files.isDirectory(java.nio.file.Path.of(saved)))
+            return java.nio.file.Path.of(saved);
+        var defaultDir = java.nio.file.Path.of(System.getProperty("user.home"), ".claude", "skills");
+        if (hasSkill(defaultDir, PATHOLOGY_SKILL)) {
+            SKILLS_DIR_PREF.set(defaultDir.toString());
+            updateSkillsTooltip();
+            return defaultDir;
         }
+        return prompt ? chooseSkillsDir() : null;
+    }
+
+    /** Ask for the skills folder; create the pathology skill there from the template if it's missing. */
+    private java.nio.file.Path chooseSkillsDir() {
+        var chooser = new javafx.stage.DirectoryChooser();
+        chooser.setTitle("Choose the folder that contains (or will contain) " + PATHOLOGY_SKILL + " and " + SCRIPTING_SKILL);
+        var home = java.nio.file.Path.of(System.getProperty("user.home"));
+        for (var c : List.of(SKILLS_DIR_PREF.get() == null ? "" : SKILLS_DIR_PREF.get(),
+                home.resolve(".claude").resolve("skills").toString(), home.toString())) {
+            if (!c.isBlank() && java.nio.file.Files.isDirectory(java.nio.file.Path.of(c))) {
+                chooser.setInitialDirectory(new File(c));
+                break;
+            }
+        }
+        File picked = chooser.showDialog(this);
+        if (picked == null)
+            return null;
+        var dir = picked.toPath();
+        // Picking a skill folder itself (one with SKILL.md) means its parent is the skills folder
+        if (java.nio.file.Files.isRegularFile(dir.resolve("SKILL.md")) && dir.getParent() != null)
+            dir = dir.getParent();
+        try {
+            if (!hasSkill(dir, PATHOLOGY_SKILL)) {
+                var skill = dir.resolve(PATHOLOGY_SKILL);
+                java.nio.file.Files.createDirectories(skill.resolve("references"));
+                java.nio.file.Files.createDirectories(skill.resolve("examples"));
+                java.nio.file.Files.write(skill.resolve("SKILL.md"), readResource("skill-template.md"));
+                output.appendText("[created " + skill + " from the template]\n");
+            }
+        } catch (IOException ex) {
+            output.appendText("[could not create the pathology skill] " + ex.getMessage() + "\n");
+        }
+        SKILLS_DIR_PREF.set(dir.toString());
+        updateSkillsTooltip();
+        output.appendText("[skills folder: " + dir + (hasSkill(dir, SCRIPTING_SKILL) ? "" : " (no " + SCRIPTING_SKILL + " found)") + "]\n");
+        return dir;
+    }
+
+    private void openSkillsFolder() {
+        var dir = resolveSkillsDir(true);
+        if (dir == null)
+            return;
+        // QuPath's helper handles macOS, Windows and Linux (java.awt.Desktop is often unsupported on Linux)
+        if (!GuiTools.browseDirectory(dir.toFile()))
+            output.appendText("[skills folder: " + dir + "]\n");
+    }
+
+    private void updateSkillsTooltip() {
+        String saved = SKILLS_DIR_PREF.get();
+        skillsFolder.setTooltip(new javafx.scene.control.Tooltip(saved == null || saved.isBlank()
+                ? "Not set yet - click to choose the folder holding the skills"
+                : "Skills: " + saved));
+    }
+
+    /** Point Claude at the skills by absolute path, so they work whether or not the CLI auto-discovers them. */
+    private static String skillsBlock(java.nio.file.Path root, boolean imageAttached) {
+        var sb = new StringBuilder();
+        if (imageAttached && hasSkill(root, PATHOLOGY_SKILL))
+            sb.append("\n- Image review: read ").append(root.resolve(PATHOLOGY_SKILL).resolve("SKILL.md"))
+              .append(" first and follow it; its references/ and examples/ are next to it.");
+        if (hasSkill(root, SCRIPTING_SKILL))
+            sb.append("\n- QuPath code: if the request involves writing or fixing a script, read ")
+              .append(root.resolve(SCRIPTING_SKILL).resolve("SKILL.md"))
+              .append(" first and check every API call against its references/.");
+        return sb.length() == 0 ? "" : "\n\nSKILLS" + sb;
     }
 
     /**

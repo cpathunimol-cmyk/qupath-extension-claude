@@ -6,7 +6,7 @@ plugins {
 qupathExtension {
     name = "qupath-extension-claude"
     group = "io.github.qupath"
-    version = "0.1.5"
+    version = "0.1.6"
     description = "Claude Code integration for QuPath"
     automaticModule = "io.github.qupath.extension.claude"
 }
